@@ -1,0 +1,210 @@
+#!/bin/bash
+set -euo pipefail
+
+MANIFEST="manifest.yaml"
+NGINX_CONF="nginx.conf"
+COMPOSE_FILE="docker-compose.yaml"
+TEMPLATES_DIR="template"
+
+log()  { echo "[swiftdeploy] $*"; }
+ok()   { echo "[swiftdeploy] ✓ $*"; }
+fail() { echo "[swiftdeploy] ✗ $*" >&2; exit 1; }
+
+parse() {
+  python3 -c "
+import sys, yaml
+with open('$MANIFEST') as f:
+    d = yaml.safe_load(f)
+keys = '$1'.split('.')
+for k in keys:
+    d = d[k]
+print(d)
+"
+}
+
+render_templates() {
+  python3 -c "
+import yaml, jinja2, sys
+
+with open('$MANIFEST') as f:
+    ctx = yaml.safe_load(f)
+
+if not ctx:
+    sys.stderr.write('[swiftdeploy] ERROR: manifest.yaml is empty or invalid\n')
+    sys.exit(1)
+
+env = jinja2.Environment(loader=jinja2.FileSystemLoader('$TEMPLATES_DIR'))
+
+nginx = env.get_template('nginx.conf.j2').render(**ctx)
+with open('$NGINX_CONF', 'w') as f:
+    f.write(nginx)
+
+compose = env.get_template('docker-compose.yaml.j2').render(**ctx)
+with open('$COMPOSE_FILE', 'w') as f:
+    f.write(compose)
+"
+}
+
+cmd_init() {
+  log "Parsing manifest and generating configs..."
+  python3 -c "import yaml, jinja2" 2>/dev/null || \
+    fail "Missing dependencies: pip install pyyaml jinja2"
+  render_templates
+  ok "Generated $NGINX_CONF"
+  ok "Generated $COMPOSE_FILE"
+}
+
+cmd_validate() {
+  local errors=0
+  echo "[swiftdeploy] Running pre-flight checks..."
+  echo ""
+
+  printf "  [1] manifest.yaml exists and is valid YAML ... "
+  if [ ! -f "$MANIFEST" ]; then
+    echo "FAIL (file not found)"; errors=$((errors + 1))
+  else
+    python3 -c "import yaml; yaml.safe_load(open('$MANIFEST'))" 2>/dev/null \
+      && echo "PASS" || { echo "FAIL (invalid YAML)"; errors=$((errors + 1)); }
+  fi
+
+  printf "  [2] Required fields present and non-empty ... "
+  python3 -c "
+import yaml, sys
+with open('$MANIFEST') as f:
+    d = yaml.safe_load(f)
+required = [('services','image'),('services','port'),('nginx','image'),('nginx','port'),('network','name'),('network','driver_type')]
+missing = [f'{s}.{k}' for s,k in required if not (d or {}).get(s,{}).get(k)]
+if missing:
+    print('FAIL (missing: ' + ', '.join(missing) + ')'); sys.exit(1)
+else:
+    print('PASS')
+" 2>/dev/null || errors=$((errors + 1))
+
+  printf "  [3] Docker image exists locally ... "
+  IMAGE=$(parse "services.image")
+  if docker image inspect "$IMAGE" > /dev/null 2>&1; then
+    echo "PASS ($IMAGE)"
+  else
+    echo "FAIL (image not found: $IMAGE)"; errors=$((errors + 1))
+  fi
+
+  printf "  [4] Nginx port not already bound ... "
+  NGINX_PORT=$(parse "nginx.port")
+  if ss -tuln 2>/dev/null | grep -q ":${NGINX_PORT} "; then
+    echo "FAIL (port $NGINX_PORT already in use)"; errors=$((errors + 1))
+  else
+    echo "PASS (port $NGINX_PORT is free)"
+  fi
+
+  printf "  [5] nginx.conf is syntactically valid ... "
+  if [ ! -f "$NGINX_CONF" ]; then
+    echo "FAIL (nginx.conf not found — run init first)"; errors=$((errors + 1))
+  else
+    NGINX_OUTPUT=$(docker run --rm \
+        -v "$(pwd)/$NGINX_CONF:/etc/nginx/conf.d/default.conf:ro" \
+        nginx:latest nginx -t 2>&1) || true
+    REAL_ERRORS=$(echo "$NGINX_OUTPUT" | grep "\[emerg\]" | grep -v "host not found in upstream") || REAL_ERRORS=""
+    if [ -z "$REAL_ERRORS" ]; then
+      echo "PASS"
+    else
+      echo "FAIL (nginx config syntax error)"
+      echo "$REAL_ERRORS"
+      errors=$((errors + 1))
+    fi
+  fi
+
+  echo ""
+  if [ "$errors" -eq 0 ]; then
+    ok "All checks passed — ready to deploy"
+  else
+    fail "$errors check(s) failed"
+  fi
+}
+
+cmd_deploy() {
+  log "Starting deployment..."
+  cmd_init
+  log "Bringing up stack..."
+  docker-compose up -d --build
+  log "Waiting for health checks (timeout: 60s)..."
+  local elapsed=0
+  local interval=5
+  until docker-compose ps | grep -q "healthy"; do
+    if [ "$elapsed" -ge 60 ]; then fail "Health check timed out after 60s"; fi
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+    log "Waiting... ${elapsed}s"
+  done
+  ok "Stack is up and healthy"
+  NGINX_PORT=$(parse "nginx.port")
+  log "Service available at http://localhost:${NGINX_PORT}"
+}
+
+cmd_promote() {
+  local target="${1:-}"
+  if [[ "$target" != "canary" && "$target" != "stable" ]]; then
+    fail "Usage: ./swiftdeploy promote [canary|stable]"
+  fi
+  log "Promoting to $target mode..."
+  python3 -c "
+import yaml
+with open('$MANIFEST', 'r') as f:
+    d = yaml.safe_load(f)
+d['services']['mode'] = '$target'
+with open('$MANIFEST', 'w') as f:
+    yaml.dump(d, f, default_flow_style=False, sort_keys=False)
+"
+  ok "Updated manifest.yaml → mode: $target"
+  render_templates
+  ok "Regenerated $COMPOSE_FILE"
+  log "Restarting API container..."
+  docker-compose up -d --no-deps --force-recreate api
+  ok "API container restarted"
+  log "Waiting for health check..."
+  local elapsed=0
+  until docker-compose ps api | grep -q "healthy"; do
+    if [ "$elapsed" -ge 30 ]; then fail "Health check timed out after 30s"; fi
+    sleep 3; elapsed=$((elapsed + 3))
+  done
+  NGINX_PORT=$(parse "nginx.port")
+  log "Confirming mode via /healthz..."
+  sleep 2
+  RESPONSE=$(curl -s "http://localhost:${NGINX_PORT}/healthz")
+  ok "Health check response: $RESPONSE"
+  if [[ "$target" == "canary" ]]; then
+    HEADER=$(curl -sI "http://localhost:${NGINX_PORT}/" | grep -i "x-mode" || echo "(none)")
+    ok "X-Mode header: $HEADER"
+  fi
+  ok "Promotion to $target complete"
+}
+
+cmd_teardown() {
+  local clean=false
+  [[ "${1:-}" == "--clean" ]] && clean=true
+  log "Tearing down stack..."
+  docker-compose down -v --remove-orphans 2>/dev/null || true
+  ok "Containers, networks, and volumes removed"
+  if [ "$clean" = true ]; then
+    rm -f "$NGINX_CONF" "$COMPOSE_FILE"
+    ok "Generated configs deleted"
+  fi
+  ok "Teardown complete"
+}
+
+case "${1:-}" in
+  init)     cmd_init ;;
+  validate) cmd_validate ;;
+  deploy)   cmd_deploy ;;
+  promote)  cmd_promote "${2:-}" ;;
+  teardown) cmd_teardown "${2:-}" ;;
+  *)
+    echo "Usage: ./swiftdeploy [init|validate|deploy|promote|teardown]"
+    echo ""
+    echo "  init                     Generate nginx.conf + docker-compose.yaml"
+    echo "  validate                 Run 5 pre-flight checks"
+    echo "  deploy                   Init, bring up stack, wait for health"
+    echo "  promote [canary|stable]  Switch deployment mode"
+    echo "  teardown [--clean]       Remove stack and optionally configs"
+    exit 1
+    ;;
+esac
